@@ -74,7 +74,7 @@ def generate_structured_noise_batch_vectorized(
         cutoff_radius: Frequency cutoff radius (None = auto-calculate)
         transition_width: Width of smooth transition for frequency cutoff
         input_noise: Optional input noise tensor to use instead of generating new noise.
-        sample_magnitude_from_rayleigh: If True, sample noise magnitude from Rayleigh distribution.
+        sampling_method: Method to sample noise magnitude ('fft', 'cdf', 'two-gaussian')
     
     Returns:
         torch.Tensor: Batch of structured noise tensors of shape (B, C, H, W)
