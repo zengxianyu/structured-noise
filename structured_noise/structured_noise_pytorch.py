@@ -7,6 +7,8 @@ Gaussian noise magnitude with image phase using frequency soft cutoff.
 """
 
 import torch
+import numpy as np
+from PIL import Image
 
 
 def create_frequency_soft_cutoff_mask(height: int, width: int, cutoff_radius: float, 
@@ -266,7 +268,270 @@ def main():
         structured_noise.save(output_path)
         print(f"Saved structured noise with cutoff radius {cutoff_radius} to {output_path}")
     
+def save_noise_as_image(noise: torch.Tensor, path: str):
+    noise = (noise + 0.5) / 2.0
+    noise = noise.permute(0, 2, 3, 1)
+    noise = noise.cpu().numpy()[0]
+    noise = (noise * 255.0).astype(np.uint8)
+    noise = Image.fromarray(noise).convert('RGB')
+    noise.save(path)
+
+def main_video():
+    import cv2
+    import argparse
+    import numpy as np
+    from PIL import Image
+    import os
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--path_in', type=str, default="../town_videos/dog720p_5s.mp4")
+    parser.add_argument('--path_out', type=str, default="dog_structured_noise_video.mp4")
+    parser.add_argument('--cutoff_radius', type=float, default=40)
+    parser.add_argument('--sampling_method', type=str, default='fft')
+    args = parser.parse_args()
+    video_path = args.path_in
+    H, W = 256, 256
+    cap = cv2.VideoReader(video_path) if hasattr(cv2, "VideoReader") else cv2.VideoCapture(video_path)
+    out_writer = cv2.VideoWriter(
+        args.path_out,
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        30,
+        (H, W)
+    )
+
+    if not cap.isOpened():
+        print("Could not open video:", video_path)
+        return
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    frames = []
+    gray_frames = []
+
+    # ---- Load a few frames ----
+    max_frames = 30  # keep it small for testing
+    while len(frames) < max_frames:
+        ret, frame = cap.read() if isinstance(cap, cv2.VideoCapture) else cap.read()
+        if not ret:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        gray_frames.append(gray)
+
+    cap.release()
+    if len(frames) < 2:
+        print("Need at least 2 frames")
+        return
+
+    # ---- Resize to something manageable (e.g., 64x64) ----
+    gray_resized = [
+        cv2.resize(g, (W, H), interpolation=cv2.INTER_AREA).astype(np.float32)
+        for g in gray_frames
+    ]
+
+    # ---- Loop over frames ----
+    for t in range(len(gray_resized)):
+        curr_gray = gray_resized[t]
+        # Normalize frame
+        curr_gray_normalized = curr_gray / 255.0
+        curr_gray_normalized = (curr_gray_normalized - 0.5) * 2.0
+        curr_tensor = torch.from_numpy(curr_gray_normalized).unsqueeze(0).unsqueeze(0).to(device)  # (B=1, C=1, H, W)
+        
+        noise = generate_structured_noise_batch_vectorized(
+            curr_tensor,
+            noise_std=1.0,
+            pad_factor=1.5,
+            cutoff_radius=args.cutoff_radius,
+            transition_width=2.0,
+            sampling_method='fft',
+        )
+
+        # Post-process for saving
+        noise = (noise + 0.5) / 2.0  # Denormalize
+        noise = noise.squeeze(0).squeeze(0)  # (H, W)
+        noise_np = noise.cpu().numpy()
+        noise_np = (noise_np * 255.0).astype(np.uint8)
+        
+        # Convert grayscale to BGR for video writer
+        noise_bgr = cv2.cvtColor(noise_np, cv2.COLOR_GRAY2BGR)
+        
+        out_writer.write(noise_bgr)
+
+    out_writer.release()
+    print(f"Saved structured noise video to {args.path_out}")
+
+
+def main_video_warp():
+    import cv2
+    import argparse
+    import numpy as np
+    from PIL import Image
+    import os
+    import sys
+    import taichi as ti
+
+    # Add the path to the warping code to the system path
+    from warp_particle import ParticleWarper
+
+    ti.init(arch=ti.gpu, device_memory_GB=4.0, debug=False, default_fp=ti.f64, random_seed=0)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--path_in', type=str, default="../town_videos/dog720p_5s.mp4")
+    parser.add_argument('--path_out', type=str, default="dog_structured_noise_video_warped.mp4")
+    parser.add_argument('--cutoff_radius', type=float, default=20)
+    parser.add_argument('--sampling_method', type=str, default='fft')
+    args = parser.parse_args()
+    video_path = args.path_in
+    H, W = 256, 256
+    cap = cv2.VideoCapture(video_path)
+    out_writer = cv2.VideoWriter(
+        args.path_out,
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        30,
+        (W, H)
+    )
+
+    if not cap.isOpened():
+        print("Could not open video:", video_path)
+        return
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    frames = []
+    gray_frames = []
+
+    # ---- Load a few frames ----
+    max_frames = 90  # keep it small for testing
+    while len(frames) < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
+        frames.append(frame)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        gray_frames.append(gray)
+
+    cap.release()
+    if len(frames) < 2:
+        print("Need at least 2 frames")
+        return
+
+    # ---- Generate initial noise from the first frame ----
+    first_frame_normalized = (frames[0].astype(np.float32) / 255.0 - 0.5) * 2.0
+    first_frame_tensor = torch.from_numpy(first_frame_normalized).permute(2, 0, 1).unsqueeze(0).to(device)
+
+    # Using 3 channels for the initial noise for color video
+    initial_noise = generate_structured_noise_batch_vectorized(
+        first_frame_tensor,
+        noise_std=1.0,
+        pad_factor=1.5,
+        cutoff_radius=args.cutoff_radius,
+        transition_width=2.0,
+        sampling_method=args.sampling_method,
+    )
+    
+    # The warper works with numpy arrays on CPU
+    prev_noise = initial_noise.squeeze(0).permute(1, 2, 0).cpu().numpy()
+
+    # Save first frame of noise
+    noise_to_save = (prev_noise - prev_noise.min()) / (prev_noise.max() - prev_noise.min())
+    noise_to_save = (noise_to_save * 255).astype(np.uint8)
+    out_writer.write(cv2.cvtColor(noise_to_save, cv2.COLOR_RGB2BGR))
+
+    # ---- Setup for warping ----
+    n_noise_channels = prev_noise.shape[2]
+    warper = ParticleWarper(H, W, n_noise_channels)
+
+    # identity maps (cell center)
+    i = np.arange(H) + 0.5
+    j = np.arange(W) + 0.5
+    ii, jj = np.meshgrid(i, j, indexing='ij')
+    identity_cc = np.stack((jj, ii), axis=-1) # Note: meshgrid and opencv use (x,y) which is (W,H)
+
+    # ---- Loop over frames and warp noise ----
+    for t in range(1, len(gray_frames)):
+        print(f"Processing frame {t}")
+        prev_gray = gray_frames[t-1]
+        curr_gray = gray_frames[t]
+
+        # Calculate optical flow
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        
+        # The warper expects a map of where each grid point *comes from*.
+        # Flow is (dx, dy), so new_pos = old_pos + flow.
+        # The deformation map should be old_pos = new_pos - flow.
+        # Here, new_pos is `identity_cc`.
+        # The flow from Farneback is how pixels move from prev to curr.
+        # So a pixel at (x,y) in prev is at (x+dx, y+dy) in curr.
+        # The deformation map for the warper should be `identity_cc - flow`.
+        # The `map_field` in the kernel is where the destination pixel `(i,j)` comes from in the source.
+        # So we need backward flow. `calcOpticalFlowFarneback` computes forward flow.
+        # For warping, we need to know for each pixel in the target image, where it comes from in the source.
+        # Let's use the forward flow as an approximation of the backward flow for simplicity,
+        # which is not entirely correct but often works for small motions.
+        # A better way would be to compute backward flow, or use the forward flow to construct a backward map.
+        # Let's stick to the logic from the example: `identity_cc - flow_map_i`
+        
+        # The flow from opencv is (dx, dy) for each pixel.
+        # The shape is (H, W, 2).
+        # `identity_cc` is (H, W, 2) with (x, y) coordinates.
+        # The deformation map should be where each pixel of the new image comes from in the old one.
+        # `map_field[i,j]` is the coordinate in the old image that maps to `(i,j)` in the new image.
+        # `flow[y,x]` gives the displacement `(dx, dy)`. A pixel at `(x,y)` in `prev_gray` moves to `(x+dx, y+dy)` in `curr_gray`.
+        # So, a pixel at `(x', y')` in `curr_gray` comes from `(x'-dx, y'-dy)` in `prev_gray`.
+        # The flow we have is `flow(x,y)`. We need `flow(x', y')`. We approximate `flow(x',y')` with `flow(x,y)`.
+        # So the source coordinate is `(x,y) - flow(x,y)`.
+        # The `identity_cc` has shape (H, W, 2) and stores `(x,y)` coordinates.
+        # The `flow` has shape (H, W, 2) and stores `(dx,dy)`.
+        # The deformation map is `identity_cc - flow`.
+        # Note on indexing: `meshgrid` with `indexing='ij'` gives `ii` with shape (H,W) and `jj` with shape (H,W).
+        # `ii` has row indices, `jj` has column indices.
+        # OpenCV flow `(dx, dy)` corresponds to `(d_col, d_row)`.
+        # `identity_cc` was created with `(jj, ii)` so it's `(x,y)` i.e. `(col, row)`.
+        # So `identity_cc - flow` should be correct.
+        
+        # The `warp_particle` code uses `(i,j)` as `(row, col)`.
+        # Let's re-create identity_cc to be sure.
+        i_coords = np.arange(H) + 0.5 # rows
+        j_coords = np.arange(W) + 0.5 # cols
+        jj, ii = np.meshgrid(j_coords, i_coords) # jj is x, ii is y
+        identity_map = np.stack((ii, jj), axis=-1)
+
+        # flow from opencv is also (dx, dy) where dx is change in x (columns), dy is change in y (rows)
+        # But the order in the last dim is (dx, dy).
+        # The `map_field` in `warp_particle` is indexed by `(i,j)` which is `(row, col)`.
+        # And it expects `(y,x)` coordinates.
+        # `warped_pos = map_field[i, j]-0.5`
+        # `lower_corner = ti.math.floor(warped_pos)`
+        # `lower_x, lower_y = int(lower_corner.x), int(lower_corner.y)`
+        # Here `x` is the first component, `y` is the second.
+        # So `map_field` should store `(row_coord, col_coord)`.
+        # `identity_map` created above has `(y,x)` i.e. `(row, col)` coords.
+        # The flow from opencv has `(dx, dy)`. We need to swap it to `(dy, dx)` to match our `identity_map`.
+        flow_swapped = np.stack((flow[..., 1], flow[..., 0]), axis=-1)
+        
+        deformation_map = identity_map - flow_swapped
+
+        warper.set_deformation(deformation_map)
+        warper.set_noise(prev_noise)
+        warper.run()
+        warped_noise = warper.noise_field.to_numpy()
+
+        # Post-process for saving
+        noise_to_save = (warped_noise - warped_noise.min()) / (warped_noise.max() - warped_noise.min())
+        noise_to_save = (noise_to_save * 255).astype(np.uint8)
+        out_writer.write(cv2.cvtColor(noise_to_save, cv2.COLOR_RGB2BGR))
+
+        prev_noise = warped_noise
+
+    out_writer.release()
+    print(f"Saved structured noise video to {args.path_out}")
 
 
 if __name__ == "__main__":
-    main()
+    # main_video()
+    main_video_warp()
