@@ -36,7 +36,7 @@ If you find this work useful, please cite:
   title   = {{NeuralRemaster}: Phase-Preserving Diffusion for Structure-Aligned Generation},
   author  = {Zeng, Yu and Ochoa, Charles and Zhou, Mingyuan and Patel, Vishal M and
              Guizilini, Vitor and McAllister, Rowan},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
+  journal = {arXiv preprint arXiv:2512.05106},
   year    = {2025}
 }
 ```
